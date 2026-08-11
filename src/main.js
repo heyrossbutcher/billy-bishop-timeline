@@ -4,7 +4,8 @@ import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer
 import { Line2 }        from 'three/addons/lines/Line2.js';
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
-import { events } from './data/events.js';
+import { events as localEvents } from './data/events.js';
+import { fetchEvents } from './sanity.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 // Horizontal (wide) layout
@@ -436,5 +437,17 @@ window.addEventListener('resize', () => {
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-buildScene(isVertical);
+let events = localEvents;
+
 animate();
+
+fetchEvents().then(remote => {
+  if (remote && remote.length > 0) {
+    events = remote;
+    buildScene(isVertical);
+  } else {
+    buildScene(isVertical);
+  }
+}).catch(() => {
+  buildScene(isVertical);
+});
