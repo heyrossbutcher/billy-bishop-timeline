@@ -1,0 +1,118 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #0a0a0a;
+  overflow: hidden;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  cursor: grab;
+  user-select: none;
+}
+
+body.is-dragging { cursor: grabbing; }
+
+/* ── Year labels (zoomed-out state) ──────────────────────────────────────────── */
+
+.year-label {
+  font-size: 38px;
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  padding: 6px 10px;
+  background: #0a0a0a; /* masks connector line behind it */
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: block;
+  text-align: center;
+  opacity: 1;
+  transition: opacity 0.35s ease, color 0.18s ease;
+}
+
+.year-label:hover { color: rgba(255, 255, 255, 0.5); }
+
+/* ── Cards (zoomed-in state) ─────────────────────────────────────────────────── */
+
+.timeline-card {
+  width: 280px;
+  background: #111111;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 14px;
+  padding: 26px 22px;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.03),
+    0 24px 60px rgba(0, 0, 0, 0.7);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s ease, border-color 0.2s ease, filter 0.2s ease;
+  will-change: opacity;
+}
+
+.timeline-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  filter: brightness(1.12);
+}
+
+.card-year {
+  font-size: 38px;
+  font-weight: 700;
+  color: #ffffff;
+  line-height: 1;
+  margin-bottom: 10px;
+  letter-spacing: -0.04em;
+}
+
+.card-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.8);
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+.card-desc {
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.4);
+  line-height: 1.7;
+}
+
+/* ── HUD ─────────────────────────────────────────────────────────────────────── */
+
+#title-block {
+  position: fixed;
+  top: 28px;
+  right: 32px;
+  text-align: right;
+  pointer-events: none;
+  z-index: 200;
+}
+
+#title-block h1 {
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.8);
+  letter-spacing: -0.01em;
+}
+
+#title-block p {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.25);
+  margin-top: 3px;
+  letter-spacing: 0.04em;
+}
+
+#hint {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.22);
+  letter-spacing: 0.07em;
+  pointer-events: none;
+  z-index: 200;
+  transition: opacity 1.2s ease;
+  white-space: nowrap;
+}
