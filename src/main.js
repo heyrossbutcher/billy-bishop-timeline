@@ -29,6 +29,29 @@ const INITIAL_Z   = 1500;
 const THRESHOLD_Z = 1075;
 const BREAKPOINT  = 728;
 
+// ── Status colours ────────────────────────────────────────────────────────────
+const STATUS = {
+  good:      { hex: 0x4ade80, css: '#4ade80' },
+  worrisome: { hex: 0xfacc15, css: '#facc15' },
+  bad:       { hex: 0xf87171, css: '#f87171' },
+};
+function statusColor(status) {
+  return STATUS[status] ?? { hex: 0xffffff, css: 'rgba(255,255,255,0.15)' };
+}
+
+// ── Timeline year mapping ─────────────────────────────────────────────────────
+const YEAR_START    = 1931;
+const YEAR_END      = 2026;
+const TOTAL_LENGTH  = 12000;  // total line length in THREE units
+const GROUP_SPREAD  = 150;    // units between same-year events when fully spread
+const SPREAD_START_Z = THRESHOLD_Z;
+const SPREAD_END_Z   = 650;
+
+function yearToPos(year, vert) {
+  const t = (year - YEAR_START) / (YEAR_END - YEAR_START);
+  return vert ? -t * TOTAL_LENGTH : t * TOTAL_LENGTH - TOTAL_LENGTH / 2;
+}
+
 // ── Renderer setup (done once) ────────────────────────────────────────────────
 const scene    = new THREE.Scene();
 const cssScene = new THREE.Scene();
@@ -74,7 +97,9 @@ let isVertical = innerWidth <= BREAKPOINT;
 let backbone   = null;
 let dotMeshes  = [], glowSprites = [], connectors = [], lineMaterials = [];
 let yearEls    = [], cardEls = [];
+let yearObjs   = [], cardObjs = [];
 let positions  = [];
+let spreadDeltas = [];
 let zoomedIn   = null;
 
 // ── Camera / pan state ────────────────────────────────────────────────────────
@@ -92,6 +117,34 @@ function makeLine2(p1, p2, linewidth, opacity = 1) {
     linewidth,
     transparent: opacity < 1,
     opacity,
+    resolution: new THREE.Vector2(innerWidth, innerHeight),
+    depthTest: true,
+  });
+  lineMaterials.push(mat);
+  const line = new Line2(geo, mat);
+  line.computeLineDistances();
+  return line;
+}
+
+// ── Wavy backbone ─────────────────────────────────────────────────────────────
+function makeWavyBackbone(start, end, vert) {
+  const segments = 120;
+  const amp  = 60;   // wave height in THREE units
+  const freq = 3;    // number of full cycles across the whole line
+  const pts  = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const x = THREE.MathUtils.lerp(start.x, end.x, t);
+    const y = THREE.MathUtils.lerp(start.y, end.y, t);
+    const envelope = t <= 0.25 ? 1 : 1 - (t - 0.25) / 0.75;
+    const offset = amp * envelope * Math.sin(t * Math.PI * 2 * freq);
+    pts.push(vert ? x + offset : x, vert ? y : y + offset, 0);
+  }
+  const geo = new LineGeometry();
+  geo.setPositions(pts);
+  const mat = new LineMaterial({
+    color: 0xffffff,
+    linewidth: 2,
     resolution: new THREE.Vector2(innerWidth, innerHeight),
     depthTest: true,
   });
@@ -138,6 +191,9 @@ function clearScene() {
   cardEls.forEach(el  => el.parentNode?.removeChild(el));
   yearEls.length = 0;
   cardEls.length = 0;
+  yearObjs.length = 0;
+  cardObjs.length = 0;
+  spreadDeltas.length = 0;
 
   hoveredDotIndex = -1;
   document.body.style.cursor = '';
@@ -149,51 +205,69 @@ function buildScene(vert) {
   clearScene();
   isVertical = vert;
 
-  const sp = vert ? VERT_SPACING : SPACING;
+  // Group events by year for spread calculation
+  const yearGroups = {};
+  events.forEach((ev, i) => {
+    if (!yearGroups[ev.year]) yearGroups[ev.year] = [];
+    yearGroups[ev.year].push(i);
+  });
 
-  // Compute 3-D positions for each event
-  positions = events.map((_, i) => {
-    const alt = i % 2 === 0;
+  // Compute 3-D positions proportionally by year
+  positions = events.map((ev, i) => {
+    const alt  = i % 2 === 0;
+    const base = yearToPos(ev.year, vert);
     if (vert) {
-      const y = -i * sp;
       return {
-        dot:   new THREE.Vector3(0, y, 0),
-        card:  new THREE.Vector3(0, y, 0),   // centred on the dot
-        label: new THREE.Vector3(0, y + (alt ? VERT_LABEL_OFFSET : -VERT_LABEL_OFFSET), 0),
+        dot:   new THREE.Vector3(0, base, 0),
+        card:  new THREE.Vector3(0, base, 0),
+        label: new THREE.Vector3(0, base + (alt ? VERT_LABEL_OFFSET : -VERT_LABEL_OFFSET), 0),
         alt,
       };
     } else {
-      const x = (i - (events.length - 1) / 2) * sp;
       return {
-        dot:   new THREE.Vector3(x, 0, 0),
-        card:  new THREE.Vector3(x, alt ? CARD_Y : -CARD_Y, 0),
-        label: new THREE.Vector3(x, alt ? LABEL_Y : -LABEL_Y, 0),
+        dot:   new THREE.Vector3(base, 0,                    0),
+        card:  new THREE.Vector3(base, alt ? CARD_Y : -CARD_Y, 0),
+        label: new THREE.Vector3(base, alt ? LABEL_Y : -LABEL_Y, 0),
         alt,
       };
     }
   });
 
-  // Pan limits (minPan may be greater than maxPan in vertical mode — clampPan handles it)
+  // Spread deltas — offset each event within a same-year group when zoomed in
+  spreadDeltas = events.map((ev, i) => {
+    const group = yearGroups[ev.year];
+    if (group.length === 1) return 0;
+    return (group.indexOf(i) - (group.length - 1) / 2) * GROUP_SPREAD;
+  });
+
+  // Pan limits (padded by max possible spread)
+  const maxSpread = Math.max(...events.map(ev => (yearGroups[ev.year].length - 1) / 2 * GROUP_SPREAD));
   if (vert) {
     minPan = 0;
-    maxPan = -(events.length - 1) * sp;
+    maxPan = yearToPos(YEAR_END, true) - maxSpread;
   } else {
-    minPan = positions[0].dot.x;
-    maxPan = positions.at(-1).dot.x;
+    minPan = yearToPos(YEAR_START, false) - maxSpread;
+    maxPan = yearToPos(YEAR_END,   false) + maxSpread;
   }
-  targetPan = currentPan = minPan;
+  targetPan = currentPan = vert ? 0 : yearToPos(YEAR_START, false);
 
   // Camera orientation (set once here; animate only moves position)
   if (vert) {
     camera.position.set(0, 0, INITIAL_Z);
     camera.lookAt(0, 0, 0);
   } else {
-    camera.position.set(minPan, CAM_Y, INITIAL_Z);
-    camera.lookAt(minPan, 0, 0);
+    camera.position.set(yearToPos(YEAR_START, false), CAM_Y, INITIAL_Z);
+    camera.lookAt(yearToPos(YEAR_START, false), 0, 0);
   }
 
-  // Backbone
-  backbone = makeLine2(positions[0].dot, positions.at(-1).dot, 2);
+  // Backbone — full year span, fixed endpoints
+  const lineStart = vert
+    ? new THREE.Vector3(0, yearToPos(YEAR_START, true),  0)
+    : new THREE.Vector3(yearToPos(YEAR_START, false), 0, 0);
+  const lineEnd = vert
+    ? new THREE.Vector3(0, yearToPos(YEAR_END, true),  0)
+    : new THREE.Vector3(yearToPos(YEAR_END, false), 0, 0);
+  backbone = makeWavyBackbone(lineStart, lineEnd, vert);
   scene.add(backbone);
 
   // Per-event objects
@@ -202,9 +276,10 @@ function buildScene(vert) {
     const dir = alt ? 1 : -1;
 
     // Dot
+    const col = statusColor(ev.status);
     const dot = new THREE.Mesh(
       new THREE.SphereGeometry(7, 24, 24),
-      new THREE.MeshBasicMaterial({ color: 0xffffff }),
+      new THREE.MeshBasicMaterial({ color: col.hex }),
     );
     dot.position.copy(dotPos);
     dot.userData.eventIndex = i;
@@ -214,6 +289,7 @@ function buildScene(vert) {
     // Glow
     const glow = new THREE.Sprite(new THREE.SpriteMaterial({
       map: glowTex,
+      color: col.hex,
       transparent: true,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
@@ -225,11 +301,12 @@ function buildScene(vert) {
     glowSprites.push(glow);
 
     // Connector — vertical mode: card is centred on dot so no stem needed
+    // Geometry is origin-relative so conn.position can track the dot during spread
     if (!vert) {
-      const dir      = alt ? 1 : -1;
-      const connStart = new THREE.Vector3(dotPos.x, dir * 9,                     0);
-      const connEnd   = new THREE.Vector3(dotPos.x, dir * (CARD_Y - CARD_HALF_H), 0);
+      const connStart = new THREE.Vector3(0, dir * 9,                     0);
+      const connEnd   = new THREE.Vector3(0, dir * (CARD_Y - CARD_HALF_H), 0);
       const conn      = makeLine2(connStart, connEnd, 2, 0.35);
+      conn.position.x = dotPos.x;
       conn.visible    = false;
       scene.add(conn);
       connectors.push(conn);
@@ -245,10 +322,12 @@ function buildScene(vert) {
     labelObj.scale.setScalar(CARD_SCALE);
     cssScene.add(labelObj);
     yearEls.push(labelDiv);
+    yearObjs.push(labelObj);
 
     // Card (CSS3D)
     const cardDiv = document.createElement('div');
     cardDiv.className = 'timeline-card';
+    cardDiv.style.borderLeft = `3px solid ${col.css}`;
     cardDiv.innerHTML = `
       <div class="card-year">${ev.year}</div>
       <div class="card-title">${ev.title}</div>
@@ -259,6 +338,7 @@ function buildScene(vert) {
     cardObj.scale.setScalar(CARD_SCALE);
     cssScene.add(cardObj);
     cardEls.push(cardDiv);
+    cardObjs.push(cardObj);
   });
 
   setZoomState(false);
@@ -293,9 +373,15 @@ function clampPan(v) {
 }
 
 function zoomToEvent(index) {
-  const pos = positions[index].dot;
-  targetPan = clampPan(isVertical ? pos.y : pos.x);
-  targetZ   = 480;
+  const spreadT = THREE.MathUtils.clamp(
+    (SPREAD_START_Z - currentZ) / (SPREAD_START_Z - SPREAD_END_Z),
+    0, 1,
+  );
+  const base  = positions[index].dot;
+  const delta = (spreadDeltas[index] || 0) * spreadT;
+  const pan   = isVertical ? base.y + delta : base.x + delta;
+  targetPan   = clampPan(pan);
+  targetZ     = 480;
 }
 
 // ── Interaction ───────────────────────────────────────────────────────────────
@@ -400,6 +486,32 @@ function animate() {
   }
 
   setZoomState(currentZ < THRESHOLD_Z);
+
+  // Spread same-year events as camera zooms in
+  if (spreadDeltas.length) {
+    const spreadT = THREE.MathUtils.clamp(
+      (SPREAD_START_Z - currentZ) / (SPREAD_START_Z - SPREAD_END_Z),
+      0, 1,
+    );
+    dotMeshes.forEach((dot, i) => {
+      const base  = positions[i];
+      const delta = spreadDeltas[i] * spreadT;
+      if (isVertical) {
+        const ny = base.dot.y + delta;
+        dot.position.y            = ny;
+        glowSprites[i].position.y = ny;
+        if (cardObjs[i])  cardObjs[i].position.y  = base.card.y  + delta;
+        if (yearObjs[i])  yearObjs[i].position.y  = base.label.y + delta;
+      } else {
+        const nx = base.dot.x + delta;
+        dot.position.x            = nx;
+        glowSprites[i].position.x = nx;
+        if (cardObjs[i])   cardObjs[i].position.x   = base.card.x  + delta;
+        if (yearObjs[i])   yearObjs[i].position.x   = base.label.x + delta;
+        if (connectors[i]) connectors[i].position.x = nx;
+      }
+    });
+  }
 
   const t = performance.now() * 0.001;
   glowSprites.forEach((glow, i) => {

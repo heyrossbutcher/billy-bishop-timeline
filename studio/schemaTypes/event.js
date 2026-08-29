@@ -24,6 +24,19 @@ export default defineType({
       rows: 3,
       validation: Rule => Rule.required(),
     }),
+    defineField({
+      name: 'status',
+      title: 'Status',
+      type: 'string',
+      options: {
+        list: [
+          { title: 'Good', value: 'good' },
+          { title: 'Worrisome', value: 'worrisome' },
+          { title: 'Bad', value: 'bad' },
+        ],
+        layout: 'radio',
+      },
+    }),
   ],
   orderings: [
     {
@@ -33,6 +46,10 @@ export default defineType({
     },
   ],
   preview: {
-    select: { title: 'title', subtitle: 'year' },
+    select: { title: 'title', subtitle: 'year', status: 'status' },
+    prepare({ title, subtitle, status }) {
+      const indicator = status === 'good' ? '🟢' : status === 'worrisome' ? '🟡' : status === 'bad' ? '🔴' : '';
+      return { title: `${indicator} ${title}`, subtitle: String(subtitle) };
+    },
   },
 });
