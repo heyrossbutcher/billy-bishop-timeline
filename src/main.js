@@ -105,6 +105,8 @@ let zoomedIn   = null;
 // ── Camera / pan state ────────────────────────────────────────────────────────
 let targetPan  = 0, currentPan = 0;
 let targetZ    = INITIAL_Z, currentZ = INITIAL_Z;
+let targetCamY = CAM_Y, currentCamY = CAM_Y;
+let focusedEventIndex = -1;
 let minPan     = 0, maxPan = 0;
 let hoveredDotIndex = -1;
 
@@ -127,24 +129,41 @@ function makeLine2(p1, p2, linewidth, opacity = 1) {
 }
 
 // ── Wavy backbone ─────────────────────────────────────────────────────────────
+const WAVE_AMP  = 60;
+const WAVE_FREQ = 3;
+const WAVE_Z_AMP  = 80;
+const WAVE_Z_FREQ = 1.7;
+
+function waveOffset(t) {
+  let amp;
+  if (t <= 0.25) {
+    amp = WAVE_AMP * THREE.MathUtils.lerp(2, 1, t / 0.25);
+  } else {
+    amp = WAVE_AMP * (1 - (t - 0.25) / 0.75);
+  }
+  return amp * Math.sin(t * Math.PI * 2 * WAVE_FREQ);
+}
+
+function waveOffsetZ(t) {
+  return WAVE_Z_AMP * Math.sin(t * Math.PI * 2 * WAVE_Z_FREQ + 1.2);
+}
+
 function makeWavyBackbone(start, end, vert) {
   const segments = 120;
-  const amp  = 60;   // wave height in THREE units
-  const freq = 3;    // number of full cycles across the whole line
   const pts  = [];
   for (let i = 0; i <= segments; i++) {
-    const t = i / segments;
-    const x = THREE.MathUtils.lerp(start.x, end.x, t);
-    const y = THREE.MathUtils.lerp(start.y, end.y, t);
-    const envelope = t <= 0.25 ? 1 : 1 - (t - 0.25) / 0.75;
-    const offset = amp * envelope * Math.sin(t * Math.PI * 2 * freq);
-    pts.push(vert ? x + offset : x, vert ? y : y + offset, 0);
+    const t      = i / segments;
+    const x      = THREE.MathUtils.lerp(start.x, end.x, t);
+    const y      = THREE.MathUtils.lerp(start.y, end.y, t);
+    const offset = waveOffset(t);
+    const offsetZ = waveOffsetZ(t);
+    pts.push(vert ? x + offset : x, vert ? y : y + offset, offsetZ);
   }
   const geo = new LineGeometry();
   geo.setPositions(pts);
   const mat = new LineMaterial({
     color: 0xffffff,
-    linewidth: 2,
+    linewidth: 0.5,
     resolution: new THREE.Vector2(innerWidth, innerHeight),
     depthTest: true,
   });
@@ -212,42 +231,58 @@ function buildScene(vert) {
     yearGroups[ev.year].push(i);
   });
 
-  // Compute 3-D positions proportionally by year
+  // Max spread is right-only: (n-1) × GROUP_SPREAD past the year position
+  const maxSpread   = Math.max(...events.map(ev => (yearGroups[ev.year].length - 1) * GROUP_SPREAD));
+  const hBackboneEnd = yearToPos(YEAR_END, false) + maxSpread;
+  const hBackboneLen = hBackboneEnd - yearToPos(YEAR_START, false);
+
+  // Compute 3-D positions — vertical: evenly spaced; horizontal: proportional by year
   positions = events.map((ev, i) => {
-    const alt  = i % 2 === 0;
-    const base = yearToPos(ev.year, vert);
+    const alt = i % 2 === 0;
+    let base, t;
+    if (vert) {
+      base = -i * VERT_SPACING;
+      t    = events.length > 1 ? i / (events.length - 1) : 0;
+    } else {
+      base = yearToPos(ev.year, false);
+      // t relative to the extended backbone so dots sit exactly on the wave
+      t    = (base - yearToPos(YEAR_START, false)) / hBackboneLen;
+    }
+    const wave  = waveOffset(t);
+    const waveZ = waveOffsetZ(t);
     if (vert) {
       return {
-        dot:   new THREE.Vector3(0, base, 0),
-        card:  new THREE.Vector3(0, base, 0),
-        label: new THREE.Vector3(0, base + (alt ? VERT_LABEL_OFFSET : -VERT_LABEL_OFFSET), 0),
+        dot:   new THREE.Vector3(wave, base, waveZ),
+        card:  new THREE.Vector3(wave, base, waveZ),
+        label: new THREE.Vector3(wave, base + (alt ? VERT_LABEL_OFFSET : -VERT_LABEL_OFFSET), waveZ),
         alt,
       };
     } else {
       return {
-        dot:   new THREE.Vector3(base, 0,                    0),
-        card:  new THREE.Vector3(base, alt ? CARD_Y : -CARD_Y, 0),
-        label: new THREE.Vector3(base, alt ? LABEL_Y : -LABEL_Y, 0),
+        dot:   new THREE.Vector3(base, wave,                           waveZ),
+        card:  new THREE.Vector3(base, wave + (alt ? CARD_Y : -CARD_Y), waveZ),
+        label: new THREE.Vector3(base, wave + (alt ? LABEL_Y : -LABEL_Y), waveZ),
         alt,
       };
     }
   });
 
-  // Spread deltas — offset each event within a same-year group when zoomed in
+  // Spread deltas — same-year events go right only (index 0 stays at year pos)
   spreadDeltas = events.map((ev, i) => {
     const group = yearGroups[ev.year];
     if (group.length === 1) return 0;
-    return (group.indexOf(i) - (group.length - 1) / 2) * GROUP_SPREAD;
+    return group.indexOf(i) * GROUP_SPREAD;
   });
+  // Vertical mode: each event already has a unique Y slot — no spread needed
+  if (vert) spreadDeltas.fill(0);
 
-  // Pan limits (padded by max possible spread)
-  const maxSpread = Math.max(...events.map(ev => (yearGroups[ev.year].length - 1) / 2 * GROUP_SPREAD));
+  // Pan limits
   if (vert) {
     minPan = 0;
-    maxPan = yearToPos(YEAR_END, true) - maxSpread;
+    maxPan = -(events.length - 1) * VERT_SPACING;
   } else {
-    minPan = yearToPos(YEAR_START, false) - maxSpread;
-    maxPan = yearToPos(YEAR_END,   false) + maxSpread;
+    minPan = yearToPos(YEAR_START, false);
+    maxPan = hBackboneEnd;
   }
   targetPan = currentPan = vert ? 0 : yearToPos(YEAR_START, false);
 
@@ -257,16 +292,16 @@ function buildScene(vert) {
     camera.lookAt(0, 0, 0);
   } else {
     camera.position.set(yearToPos(YEAR_START, false), CAM_Y, INITIAL_Z);
-    camera.lookAt(yearToPos(YEAR_START, false), 0, 0);
+    camera.lookAt(yearToPos(YEAR_START, false), CAM_Y, 0);
   }
 
-  // Backbone — full year span, fixed endpoints
+  // Backbone — extends to cover fully-spread same-year events
   const lineStart = vert
-    ? new THREE.Vector3(0, yearToPos(YEAR_START, true),  0)
+    ? new THREE.Vector3(0, 0, 0)
     : new THREE.Vector3(yearToPos(YEAR_START, false), 0, 0);
   const lineEnd = vert
-    ? new THREE.Vector3(0, yearToPos(YEAR_END, true),  0)
-    : new THREE.Vector3(yearToPos(YEAR_END, false), 0, 0);
+    ? new THREE.Vector3(0, -(events.length - 1) * VERT_SPACING, 0)
+    : new THREE.Vector3(hBackboneEnd, 0, 0);
   backbone = makeWavyBackbone(lineStart, lineEnd, vert);
   scene.add(backbone);
 
@@ -279,7 +314,7 @@ function buildScene(vert) {
     const col = statusColor(ev.status);
     const dot = new THREE.Mesh(
       new THREE.SphereGeometry(7, 24, 24),
-      new THREE.MeshBasicMaterial({ color: col.hex }),
+      new THREE.MeshBasicMaterial({ color: 0xffffff }),
     );
     dot.position.copy(dotPos);
     dot.userData.eventIndex = i;
@@ -307,6 +342,8 @@ function buildScene(vert) {
       const connEnd   = new THREE.Vector3(0, dir * (CARD_Y - CARD_HALF_H), 0);
       const conn      = makeLine2(connStart, connEnd, 2, 0.35);
       conn.position.x = dotPos.x;
+      conn.position.y = dotPos.y;
+      conn.position.z = dotPos.z;
       conn.visible    = false;
       scene.add(conn);
       connectors.push(conn);
@@ -354,8 +391,43 @@ document.body.insertAdjacentHTML('beforeend', `
     <p>A history — 1931 to 2014</p>
   </div>
   <div id="hint">Drag to explore &nbsp;·&nbsp; Scroll to zoom in</div>
+  <div id="zoom-controls">
+    <button id="zoom-in"  aria-label="Zoom in">+</button>
+    <button id="zoom-out" aria-label="Zoom out">−</button>
+  </div>
+  <button id="nav-prev" aria-label="Previous event">&#8592;</button>
+  <button id="nav-next" aria-label="Next event">&#8594;</button>
 `);
 setTimeout(() => { document.getElementById('hint').style.opacity = '0'; }, 5000);
+
+function updateNavButtons() {
+  const prev = document.getElementById('nav-prev');
+  const next = document.getElementById('nav-next');
+  const show = focusedEventIndex >= 0 && !isVertical;
+  prev.classList.toggle('visible', show);
+  next.classList.toggle('visible', show);
+  if (show) {
+    prev.style.opacity = focusedEventIndex === 0 ? '0.2' : '';
+    next.style.opacity = focusedEventIndex === events.length - 1 ? '0.2' : '';
+  }
+}
+
+function navigateEvent(dir) {
+  if (focusedEventIndex < 0) return;
+  const next = Math.max(0, Math.min(events.length - 1, focusedEventIndex + dir));
+  zoomToEvent(next);
+}
+
+document.getElementById('nav-prev').addEventListener('click', () => navigateEvent(-1));
+document.getElementById('nav-next').addEventListener('click', () => navigateEvent(1));
+
+const ZOOM_STEP = 250;
+document.getElementById('zoom-in').addEventListener('click',  () => {
+  targetZ = Math.max(MIN_Z, targetZ - ZOOM_STEP);
+});
+document.getElementById('zoom-out').addEventListener('click', () => {
+  targetZ = Math.min(MAX_Z, targetZ + ZOOM_STEP);
+});
 
 // ── Derived helpers ───────────────────────────────────────────────────────────
 function pixelToUnit(px) {
@@ -381,7 +453,10 @@ function zoomToEvent(index) {
   const delta = (spreadDeltas[index] || 0) * spreadT;
   const pan   = isVertical ? base.y + delta : base.x + delta;
   targetPan   = clampPan(pan);
-  targetZ     = 480;
+  targetZ     = 300;
+  if (!isVertical) targetCamY = positions[index].card.y;
+  focusedEventIndex = index;
+  updateNavButtons();
 }
 
 // ── Interaction ───────────────────────────────────────────────────────────────
@@ -422,7 +497,14 @@ document.addEventListener('mouseup', e => {
     mouse.y = -(e.clientY / innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
     const hits = raycaster.intersectObjects(dotMeshes);
-    if (hits.length) zoomToEvent(hits[0].object.userData.eventIndex);
+    if (hits.length) {
+      zoomToEvent(hits[0].object.userData.eventIndex);
+    } else if (!e.target.closest('.timeline-card, .year-label, #zoom-controls, #nav-prev, #nav-next')) {
+      targetZ           = INITIAL_Z;
+      targetCamY        = CAM_Y;
+      focusedEventIndex = -1;
+      updateNavButtons();
+    }
   }
   dragging = false;
 });
@@ -439,6 +521,9 @@ document.addEventListener('wheel', e => {
     // V-scroll pans the timeline; H-scroll zooms
     if (!isH) targetPan = clampPan(targetPan - pixelToUnit(e.deltaY));
     else       targetZ   = Math.max(MIN_Z, Math.min(MAX_Z, targetZ + e.deltaX * 0.7));
+  } else if (focusedEventIndex >= 0) {
+    // Focused on a card — disable pan, only allow zoom
+    if (!isH) targetZ = Math.max(MIN_Z, Math.min(MAX_Z, targetZ + e.deltaY * 0.7));
   } else {
     // H-scroll pans; V-scroll zooms
     if (isH)  targetPan = clampPan(targetPan + pixelToUnit(e.deltaX) * 1.4);
@@ -463,26 +548,34 @@ document.addEventListener('keydown', e => {
     if (e.key === 'ArrowDown')  targetPan = clampPan(targetPan - step);
     if (e.key === 'ArrowLeft')  targetZ   = Math.max(MIN_Z, targetZ - 200);
     if (e.key === 'ArrowRight') targetZ   = Math.min(MAX_Z, targetZ + 200);
+  } else if (focusedEventIndex >= 0) {
+    if (e.key === 'ArrowLeft')  navigateEvent(-1);
+    if (e.key === 'ArrowRight') navigateEvent(1);
+    if (e.key === 'ArrowUp')    targetZ = Math.max(MIN_Z, targetZ - 200);
+    if (e.key === 'ArrowDown')  targetZ = Math.min(MAX_Z, targetZ + 200);
   } else {
     if (e.key === 'ArrowLeft')  targetPan = clampPan(targetPan - step);
     if (e.key === 'ArrowRight') targetPan = clampPan(targetPan + step);
     if (e.key === 'ArrowUp')    targetZ   = Math.max(MIN_Z, targetZ - 200);
     if (e.key === 'ArrowDown')  targetZ   = Math.min(MAX_Z, targetZ + 200);
   }
-  if (e.key === 'Escape') targetZ = INITIAL_Z;
+  if (e.key === 'Escape') { targetZ = INITIAL_Z; targetCamY = CAM_Y; focusedEventIndex = -1; updateNavButtons(); }
 });
 
 // ── Animate ───────────────────────────────────────────────────────────────────
 function animate() {
   requestAnimationFrame(animate);
 
-  currentPan = THREE.MathUtils.lerp(currentPan, targetPan, 0.09);
-  currentZ   = THREE.MathUtils.lerp(currentZ,   targetZ,   0.09);
+  currentPan  = THREE.MathUtils.lerp(currentPan,  targetPan,  0.09);
+  currentZ    = THREE.MathUtils.lerp(currentZ,    targetZ,    0.09);
+  currentCamY = THREE.MathUtils.lerp(currentCamY, targetCamY, 0.09);
 
   if (isVertical) {
     camera.position.set(0, currentPan, currentZ);
+    camera.lookAt(0, currentPan, 0);
   } else {
-    camera.position.set(currentPan, CAM_Y, currentZ);
+    camera.position.set(currentPan, currentCamY, currentZ);
+    camera.lookAt(currentPan, currentCamY, 0);
   }
 
   setZoomState(currentZ < THRESHOLD_Z);
@@ -506,9 +599,9 @@ function animate() {
         const nx = base.dot.x + delta;
         dot.position.x            = nx;
         glowSprites[i].position.x = nx;
-        if (cardObjs[i])   cardObjs[i].position.x   = base.card.x  + delta;
-        if (yearObjs[i])   yearObjs[i].position.x   = base.label.x + delta;
-        if (connectors[i]) connectors[i].position.x = nx;
+        if (cardObjs[i])   { cardObjs[i].position.x  = base.card.x  + delta; cardObjs[i].position.z  = base.card.z; }
+        if (yearObjs[i])   { yearObjs[i].position.x  = base.label.x + delta; yearObjs[i].position.z  = base.label.z; }
+        if (connectors[i]) { connectors[i].position.x = nx; connectors[i].position.y = base.dot.y; connectors[i].position.z = base.dot.z; }
       }
     });
   }
@@ -516,8 +609,8 @@ function animate() {
   const t = performance.now() * 0.001;
   glowSprites.forEach((glow, i) => {
     const pulse = Math.sin(t * 1.6 + i * 0.85) * 0.5 + 0.5;
-    glow.scale.setScalar(28 + pulse * 22);
-    glow.material.opacity = 0.5 - pulse * 0.32;
+    glow.scale.setScalar(50 + pulse * 40);
+    glow.material.opacity = 0.75 - pulse * 0.25;
   });
 
   dotMeshes.forEach((dot, i) => {
