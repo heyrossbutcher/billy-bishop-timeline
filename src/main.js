@@ -22,10 +22,10 @@ const CARD_HALF_W       = 70;   // half the card's effective width (280px × 0.5
 
 const CARD_SCALE  = 0.5;
 const FOV         = 50;
-const CAM_Y       = 80;    // slight downward tilt in horizontal mode
-const MIN_Z       = 350;
+const CAM_Y       = 0;
+const MIN_Z       = 300;
 const MAX_Z       = 1800;
-const INITIAL_Z   = 1500;
+const INITIAL_Z   = 1400;
 const THRESHOLD_Z = 1075;
 const BREAKPOINT  = 728;
 
@@ -62,14 +62,14 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(devicePixelRatio);
 renderer.setSize(innerWidth, innerHeight);
 Object.assign(renderer.domElement.style, {
-  position: 'absolute', top: '0', left: '0', pointerEvents: 'none',
+  position: 'absolute', top: '0', left: '0', pointerEvents: 'none', zIndex: '2',
 });
 document.body.appendChild(renderer.domElement);
 
 const cssRenderer = new CSS3DRenderer();
 cssRenderer.setSize(innerWidth, innerHeight);
 Object.assign(cssRenderer.domElement.style, {
-  position: 'absolute', top: '0', left: '0',
+  position: 'absolute', top: '0', left: '0', zIndex: '3',
 });
 document.body.appendChild(cssRenderer.domElement); // on top of WebGL so cards cover dots
 
@@ -92,18 +92,39 @@ function makeGlowTexture() {
 }
 const glowTex = makeGlowTexture();
 
+function makeRingTexture() {
+  const size = 128, c = size / 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, size, size);
+  ctx.beginPath();
+  ctx.arc(c, c, c - 2, 0, Math.PI * 2);
+  ctx.arc(c, c, (c - 2) * 0.5, 0, Math.PI * 2, true);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill('evenodd');
+  return new THREE.CanvasTexture(canvas);
+}
+const ringTex = makeRingTexture();
+const ringMat = new THREE.SpriteMaterial({ map: ringTex, transparent: true });
+
 // ── Scene state ───────────────────────────────────────────────────────────────
 let isVertical = innerWidth <= BREAKPOINT;
 let backbone   = null;
-let dotMeshes  = [], glowSprites = [], connectors = [], lineMaterials = [];
+let backboneGeo = null;
+let backboneStartX = 0, backboneBaseEndX = 0, backboneMaxSpread = 0;
+let planeIconObj = null;
+let dotMeshes  = [], dotMasks = [], glowSprites = [], connectors = [], lineMaterials = [];
 let yearEls    = [], cardEls = [];
 let yearObjs   = [], cardObjs = [];
 let positions  = [];
 let spreadDeltas = [];
+let yearGroups = {};
 let zoomedIn   = null;
 
 // ── Camera / pan state ────────────────────────────────────────────────────────
 let targetPan  = 0, currentPan = 0;
+let introPanActive = false;
 let targetZ    = INITIAL_Z, currentZ = INITIAL_Z;
 let targetCamY = CAM_Y, currentCamY = CAM_Y;
 let focusedEventIndex = -1;
@@ -131,7 +152,7 @@ function makeLine2(p1, p2, linewidth, opacity = 1) {
 // ── Wavy backbone ─────────────────────────────────────────────────────────────
 const WAVE_AMP  = 60;
 const WAVE_FREQ = 3;
-const WAVE_Z_AMP  = 80;
+const WAVE_Z_AMP  = 0;
 const WAVE_Z_FREQ = 1.7;
 
 function waveOffset(t) {
@@ -163,25 +184,35 @@ function makeWavyBackbone(start, end, vert) {
   geo.setPositions(pts);
   const mat = new LineMaterial({
     color: 0xffffff,
-    linewidth: 0.5,
+    linewidth: 3,
     resolution: new THREE.Vector2(innerWidth, innerHeight),
     depthTest: true,
   });
   lineMaterials.push(mat);
   const line = new Line2(geo, mat);
   line.computeLineDistances();
+  backboneGeo = geo;
   return line;
 }
 
 // ── Zoom state ────────────────────────────────────────────────────────────────
+function updateCardPointerEvents() {
+  cardEls.forEach((el, i) => {
+    const active = zoomedIn && (focusedEventIndex < 0 || focusedEventIndex === i);
+    el.style.pointerEvents = active ? 'auto' : 'none';
+    const link = el.querySelector('.card-source-link');
+    if (link) link.style.pointerEvents = focusedEventIndex === i ? 'auto' : 'none';
+  });
+}
+
 function setZoomState(isZoomedIn) {
   if (isZoomedIn === zoomedIn) return;
   zoomedIn = isZoomedIn;
-  cardEls.forEach(el => {
-    el.style.opacity       = isZoomedIn ? '1' : '0';
-    el.style.pointerEvents = isZoomedIn ? 'auto' : 'none';
-  });
+  updateHints();
+  cardEls.forEach(el => { el.style.opacity = isZoomedIn ? '1' : '0'; });
+  updateCardPointerEvents();
   yearEls.forEach(el => {
+    if (!el) return;
     el.style.opacity       = isZoomedIn ? '0' : '1';
     el.style.pointerEvents = isZoomedIn ? 'none' : 'auto';
   });
@@ -191,9 +222,12 @@ function setZoomState(isZoomedIn) {
 // ── Scene teardown ────────────────────────────────────────────────────────────
 function clearScene() {
   if (backbone) { scene.remove(backbone); backbone.geometry.dispose(); backbone = null; }
+  backboneGeo = null; planeIconObj = null;
 
-  dotMeshes.forEach(d => { scene.remove(d); d.geometry.dispose(); d.material.dispose(); });
+  dotMeshes.forEach(d => { scene.remove(d); });
   dotMeshes.length = 0;
+  dotMasks.forEach(d => { scene.remove(d); d.geometry.dispose(); d.material.dispose(); });
+  dotMasks.length = 0;
 
   glowSprites.forEach(s => { scene.remove(s); s.material.dispose(); });
   glowSprites.length = 0;
@@ -206,7 +240,7 @@ function clearScene() {
 
   // Remove CSS3D objects and their DOM elements
   cssScene.children.slice().forEach(c => cssScene.remove(c));
-  yearEls.forEach(el => el.parentNode?.removeChild(el));
+  yearEls.forEach(el => el?.parentNode?.removeChild(el));
   cardEls.forEach(el  => el.parentNode?.removeChild(el));
   yearEls.length = 0;
   cardEls.length = 0;
@@ -225,16 +259,16 @@ function buildScene(vert) {
   isVertical = vert;
 
   // Group events by year for spread calculation
-  const yearGroups = {};
+  yearGroups = {};
   events.forEach((ev, i) => {
     if (!yearGroups[ev.year]) yearGroups[ev.year] = [];
     yearGroups[ev.year].push(i);
   });
 
   // Max spread is right-only: (n-1) × GROUP_SPREAD past the year position
-  const maxSpread   = Math.max(...events.map(ev => (yearGroups[ev.year].length - 1) * GROUP_SPREAD));
-  const hBackboneEnd = yearToPos(YEAR_END, false) + maxSpread;
-  const hBackboneLen = hBackboneEnd - yearToPos(YEAR_START, false);
+  const maxSpread      = Math.max(...events.map(ev => (yearGroups[ev.year].length - 1) * GROUP_SPREAD));
+  const hBackboneEnd   = yearToPos(YEAR_END, false) + maxSpread;
+  const hBackboneBaseLen = yearToPos(YEAR_END, false) - yearToPos(YEAR_START, false);
 
   // Compute 3-D positions — vertical: evenly spaced; horizontal: proportional by year
   positions = events.map((ev, i) => {
@@ -245,8 +279,7 @@ function buildScene(vert) {
       t    = events.length > 1 ? i / (events.length - 1) : 0;
     } else {
       base = yearToPos(ev.year, false);
-      // t relative to the extended backbone so dots sit exactly on the wave
-      t    = (base - yearToPos(YEAR_START, false)) / hBackboneLen;
+      t    = (base - yearToPos(YEAR_START, false)) / hBackboneBaseLen;
     }
     const wave  = waveOffset(t);
     const waveZ = waveOffsetZ(t);
@@ -282,44 +315,61 @@ function buildScene(vert) {
     maxPan = -(events.length - 1) * VERT_SPACING;
   } else {
     minPan = yearToPos(YEAR_START, false);
-    maxPan = hBackboneEnd;
+    maxPan = positions[positions.length - 1].dot.x;
   }
-  targetPan = currentPan = vert ? 0 : yearToPos(YEAR_START, false);
+  // Offset initial pan so the backbone start sits in the left third of the viewport
+  const tanHalf = Math.tan(FOV * Math.PI / 360);
+  const screenWorldWidth = 2 * INITIAL_Z * tanHalf * (innerWidth / innerHeight);
+  const startPan = vert ? 0 : yearToPos(YEAR_START, false) + screenWorldWidth / 3;
+  targetPan = currentPan = startPan;
 
   // Camera orientation (set once here; animate only moves position)
   if (vert) {
     camera.position.set(0, 0, INITIAL_Z);
     camera.lookAt(0, 0, 0);
   } else {
-    camera.position.set(yearToPos(YEAR_START, false), CAM_Y, INITIAL_Z);
-    camera.lookAt(yearToPos(YEAR_START, false), CAM_Y, 0);
+    camera.position.set(startPan, CAM_Y, INITIAL_Z);
+    camera.lookAt(startPan, CAM_Y, 0);
   }
 
-  // Backbone — extends to cover fully-spread same-year events
+  // Backbone — starts at YEAR_END, extends dynamically as events spread
+  backboneStartX   = yearToPos(YEAR_START, false);
+  backboneBaseEndX = yearToPos(YEAR_END, false);
+  backboneMaxSpread = maxSpread;
   const lineStart = vert
     ? new THREE.Vector3(0, 0, 0)
-    : new THREE.Vector3(yearToPos(YEAR_START, false), 0, 0);
+    : new THREE.Vector3(backboneStartX, 0, 0);
   const lineEnd = vert
     ? new THREE.Vector3(0, -(events.length - 1) * VERT_SPACING, 0)
-    : new THREE.Vector3(hBackboneEnd, 0, 0);
+    : new THREE.Vector3(backboneBaseEndX, 0, 0);
   backbone = makeWavyBackbone(lineStart, lineEnd, vert);
   scene.add(backbone);
+
 
   // Per-event objects
   events.forEach((ev, i) => {
     const { dot: dotPos, card: cardPos, label: labelPos, alt } = positions[i];
     const dir = alt ? 1 : -1;
 
-    // Dot
+    // Dot — ring sprite (transparent center = knockout)
     const col = statusColor(ev.status);
-    const dot = new THREE.Mesh(
-      new THREE.SphereGeometry(7, 24, 24),
-      new THREE.MeshBasicMaterial({ color: 0xffffff }),
-    );
+    const dot = new THREE.Sprite(ringMat);
     dot.position.copy(dotPos);
+    dot.scale.setScalar(20);
     dot.userData.eventIndex = i;
     scene.add(dot);
     dotMeshes.push(dot);
+
+    // Depth-only occluder — hides backbone inside the knockout hole
+    const mask = new THREE.Mesh(
+      new THREE.SphereGeometry(5, 16, 16),
+      new THREE.MeshBasicMaterial({ color: col.hex }),
+    );
+    mask.position.copy(dotPos);
+    mask.renderOrder = -1;
+    scene.add(mask);
+    dotMasks.push(mask);
+
 
     // Glow
     const glow = new THREE.Sprite(new THREE.SpriteMaterial({
@@ -328,7 +378,7 @@ function buildScene(vert) {
       transparent: true,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
-      opacity: 0.55,
+      opacity: 0.75,
     }));
     glow.position.copy(dotPos);
     glow.scale.setScalar(32);
@@ -338,7 +388,7 @@ function buildScene(vert) {
     // Connector — vertical mode: card is centred on dot so no stem needed
     // Geometry is origin-relative so conn.position can track the dot during spread
     if (!vert) {
-      const connStart = new THREE.Vector3(0, dir * 9,                     0);
+      const connStart = new THREE.Vector3(0, dir * 12,                    0);
       const connEnd   = new THREE.Vector3(0, dir * (CARD_Y - CARD_HALF_H), 0);
       const conn      = makeLine2(connStart, connEnd, 2, 0.35);
       conn.position.x = dotPos.x;
@@ -349,27 +399,53 @@ function buildScene(vert) {
       connectors.push(conn);
     }
 
-    // Year label (CSS3D)
-    const labelDiv = document.createElement('div');
-    labelDiv.className = 'year-label';
-    labelDiv.textContent = ev.year;
-    labelDiv.addEventListener('click', () => zoomToEvent(i));
-    const labelObj = new CSS3DObject(labelDiv);
-    labelObj.position.copy(labelPos);
-    labelObj.scale.setScalar(CARD_SCALE);
-    cssScene.add(labelObj);
-    yearEls.push(labelDiv);
-    yearObjs.push(labelObj);
+    // Year label (CSS3D) — only for the first event in a year group
+    const isFirstInYear = yearGroups[ev.year][0] === i;
+    if (isFirstInYear) {
+      const labelDiv = document.createElement('div');
+      labelDiv.className = 'year-label';
+      labelDiv.textContent = ev.year;
+      labelDiv.addEventListener('click', () => {
+        targetPan = clampPan(isVertical ? positions[i].dot.y : positions[i].dot.x);
+        targetZ   = 550;
+        updateZoomButtons();
+      });
+      const labelObj = new CSS3DObject(labelDiv);
+      labelObj.position.copy(labelPos);
+      labelObj.scale.setScalar(CARD_SCALE);
+      cssScene.add(labelObj);
+      yearEls.push(labelDiv);
+      yearObjs.push(labelObj);
+    } else {
+      yearEls.push(null);
+      yearObjs.push(null);
+    }
 
     // Card (CSS3D)
     const cardDiv = document.createElement('div');
     cardDiv.className = 'timeline-card';
-    cardDiv.style.borderLeft = `3px solid ${col.css}`;
+    cardDiv.style.borderStyle = 'solid';
+    cardDiv.style.borderWidth = '0px 0px 3px 3px';
+    cardDiv.style.borderColor = `${col.css}80`;
+    cardDiv.addEventListener('click', () => { if (focusedEventIndex < 0) zoomToEvent(i); });
     cardDiv.innerHTML = `
-      <div class="card-year">${ev.year}</div>
+      <div class="card-hover-overlay">Click to view</div>
+      <button class="card-close" aria-label="Close">✕</button>
+      <div class="card-header">
+        <span class="card-year">${ev.year}</span>
+        ${ev.month ? `<span class="card-month">${ev.month}</span>` : ''}
+      </div>
       <div class="card-title">${ev.title}</div>
       <div class="card-desc">${ev.description}</div>
+      ${ev.source ? `<div class="card-source">Source: ${ev.source}</div>` : ''}
+      ${ev.sourceUrl ? `<a class="card-source-link" href="${ev.sourceUrl}" target="_blank" rel="noopener noreferrer">Read the source</a>` : ''}
     `;
+    cardDiv.querySelector('.card-close').addEventListener('click', e => {
+      e.stopPropagation();
+      if (yearGroups[ev.year].length === 1) targetZ = INITIAL_Z;
+      else targetZ = 550;
+      clearFocus();
+    });
     const cardObj = new CSS3DObject(cardDiv);
     cardObj.position.copy(cardPos);
     cardObj.scale.setScalar(CARD_SCALE);
@@ -385,20 +461,44 @@ function buildScene(vert) {
 }
 
 // ── HUD (inserted once) ───────────────────────────────────────────────────────
+const IMAGES = [
+  'https://picsum.photos/seed/billy1/1920/1080',
+  'https://picsum.photos/seed/billy2/1920/1080',
+  'https://picsum.photos/seed/billy3/1920/1080',
+];
+
 document.body.insertAdjacentHTML('beforeend', `
-  <div id="title-block">
-    <h1>Billy Bishop Toronto City Airport</h1>
-    <p>A history — 1931 to 2014</p>
+  <div id="bg-image"></div>
+  <div id="hint">
+    <span id="hint-drag" class="hint-item">
+      <span class="hint-icon-wrap"><img src="/src/assets/drag.svg" class="hint-icon" alt=""></span>
+      Drag to explore
+    </span>
+    <span class="hint-dot">·</span>
+    <span id="hint-scroll" class="hint-item">
+      <span class="hint-icon-wrap"><img src="/src/assets/scroll.svg" class="hint-icon" alt=""></span>
+      Scroll to zoom
+    </span>
   </div>
-  <div id="hint">Drag to explore &nbsp;·&nbsp; Scroll to zoom in</div>
   <div id="zoom-controls">
-    <button id="zoom-in"  aria-label="Zoom in">+</button>
-    <button id="zoom-out" aria-label="Zoom out">−</button>
+    <button id="zoom-in" aria-label="Zoom in"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/><line x1="13" y1="13" x2="18" y2="18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="8" y1="5" x2="8" y2="11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="5" y1="8" x2="11" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+    <button id="zoom-out" aria-label="Zoom out"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/><line x1="13" y1="13" x2="18" y2="18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="5" y1="8" x2="11" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
   </div>
-  <button id="nav-prev" aria-label="Previous event">&#8592;</button>
-  <button id="nav-next" aria-label="Next event">&#8594;</button>
+  <button id="nav-prev" aria-label="Previous event"><svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg></button>
+  <button id="nav-next" aria-label="Next event"><svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></button>
 `);
-setTimeout(() => { document.getElementById('hint').style.opacity = '0'; }, 5000);
+function updateHints() {
+  const cardFocused = focusedEventIndex >= 0;
+  document.querySelectorAll('.hint-item, .hint-dot').forEach(el => {
+    el.classList.toggle('hint-hidden', cardFocused);
+  });
+}
+
+function updateZoomButtons() {
+  const cardFocused = focusedEventIndex >= 0;
+  document.getElementById('zoom-in').classList.toggle('btn-disabled', cardFocused || targetZ <= 550);
+  document.getElementById('zoom-out').classList.toggle('btn-disabled', cardFocused || targetZ >= INITIAL_Z);
+}
 
 function updateNavButtons() {
   const prev = document.getElementById('nav-prev');
@@ -407,8 +507,10 @@ function updateNavButtons() {
   prev.classList.toggle('visible', show);
   next.classList.toggle('visible', show);
   if (show) {
-    prev.style.opacity = focusedEventIndex === 0 ? '0.2' : '';
-    next.style.opacity = focusedEventIndex === events.length - 1 ? '0.2' : '';
+    prev.style.opacity        = focusedEventIndex === 0 ? '0' : '';
+    prev.style.pointerEvents  = focusedEventIndex === 0 ? 'none' : '';
+    next.style.opacity        = focusedEventIndex === events.length - 1 ? '0' : '';
+    next.style.pointerEvents  = focusedEventIndex === events.length - 1 ? 'none' : '';
   }
 }
 
@@ -421,13 +523,28 @@ function navigateEvent(dir) {
 document.getElementById('nav-prev').addEventListener('click', () => navigateEvent(-1));
 document.getElementById('nav-next').addEventListener('click', () => navigateEvent(1));
 
-const ZOOM_STEP = 250;
+function clearFocus() {
+  focusedEventIndex = -1;
+  document.body.classList.remove('has-focused-card');
+  targetCamY        = CAM_Y;
+  updateNavButtons();
+  updateCardPointerEvents();
+  updateHints();
+  updateZoomButtons();
+  document.getElementById('bg-image').style.opacity = '0';
+}
+
 document.getElementById('zoom-in').addEventListener('click',  () => {
-  targetZ = Math.max(MIN_Z, targetZ - ZOOM_STEP);
+  clearFocus();
+  targetZ = 550;
+  updateZoomButtons();
 });
 document.getElementById('zoom-out').addEventListener('click', () => {
-  targetZ = Math.min(MAX_Z, targetZ + ZOOM_STEP);
+  clearFocus();
+  targetZ = INITIAL_Z;
+  updateZoomButtons();
 });
+updateZoomButtons();
 
 // ── Derived helpers ───────────────────────────────────────────────────────────
 function pixelToUnit(px) {
@@ -452,11 +569,23 @@ function zoomToEvent(index) {
   const base  = positions[index].dot;
   const delta = (spreadDeltas[index] || 0) * spreadT;
   const pan   = isVertical ? base.y + delta : base.x + delta;
-  targetPan   = clampPan(pan);
+  // Clamp against full-spread max so last-year events are never cut off
+  const savedMax = maxPan;
+  if (!isVertical && positions.length > 0)
+    maxPan = positions[positions.length - 1].dot.x + spreadDeltas[positions.length - 1];
+  targetPan = clampPan(pan);
+  maxPan = savedMax;
   targetZ     = 300;
   if (!isVertical) targetCamY = positions[index].card.y;
   focusedEventIndex = index;
+  document.body.classList.add('has-focused-card');
   updateNavButtons();
+  updateCardPointerEvents();
+  updateHints();
+  updateZoomButtons();
+  const bgEl = document.getElementById('bg-image');
+  bgEl.style.backgroundImage = `url(${IMAGES[index % IMAGES.length]})`;
+  bgEl.style.opacity = '0.1';
 }
 
 // ── Interaction ───────────────────────────────────────────────────────────────
@@ -498,12 +627,26 @@ document.addEventListener('mouseup', e => {
     raycaster.setFromCamera(mouse, camera);
     const hits = raycaster.intersectObjects(dotMeshes);
     if (hits.length) {
-      zoomToEvent(hits[0].object.userData.eventIndex);
+      const idx = hits[0].object.userData.eventIndex;
+      const ev  = events[idx];
+      if (yearGroups[ev.year]?.length > 1 && !zoomedIn) {
+        const savedMax = maxPan;
+        if (!isVertical && positions.length > 0)
+          maxPan = positions[positions.length - 1].dot.x + spreadDeltas[positions.length - 1];
+        targetPan = clampPan(positions[idx].dot.x);
+        maxPan = savedMax;
+        targetZ   = 550;
+        updateZoomButtons();
+      } else {
+        zoomToEvent(idx);
+      }
     } else if (!e.target.closest('.timeline-card, .year-label, #zoom-controls, #nav-prev, #nav-next')) {
-      targetZ           = INITIAL_Z;
-      targetCamY        = CAM_Y;
-      focusedEventIndex = -1;
-      updateNavButtons();
+      if (focusedEventIndex >= 0 && events[focusedEventIndex] && yearGroups[events[focusedEventIndex].year]?.length > 1) {
+        targetZ = 550;
+      } else {
+        targetZ = INITIAL_Z;
+      }
+      clearFocus();
     }
   }
   dragging = false;
@@ -522,13 +665,13 @@ document.addEventListener('wheel', e => {
     if (!isH) targetPan = clampPan(targetPan - pixelToUnit(e.deltaY));
     else       targetZ   = Math.max(MIN_Z, Math.min(MAX_Z, targetZ + e.deltaX * 0.7));
   } else if (focusedEventIndex >= 0) {
-    // Focused on a card — disable pan, only allow zoom
-    if (!isH) targetZ = Math.max(MIN_Z, Math.min(MAX_Z, targetZ + e.deltaY * 0.7));
+    // Card active — scroll fully disabled
   } else {
     // H-scroll pans; V-scroll zooms
     if (isH)  targetPan = clampPan(targetPan + pixelToUnit(e.deltaX) * 1.4);
     else       targetZ   = Math.max(MIN_Z, Math.min(MAX_Z, targetZ + e.deltaY * 0.7));
   }
+  updateZoomButtons();
 }, { passive: false });
 
 let touchStart0 = 0, touchPan0 = 0;
@@ -559,14 +702,16 @@ document.addEventListener('keydown', e => {
     if (e.key === 'ArrowUp')    targetZ   = Math.max(MIN_Z, targetZ - 200);
     if (e.key === 'ArrowDown')  targetZ   = Math.min(MAX_Z, targetZ + 200);
   }
-  if (e.key === 'Escape') { targetZ = INITIAL_Z; targetCamY = CAM_Y; focusedEventIndex = -1; updateNavButtons(); }
+  if (e.key === 'Escape') { targetZ = INITIAL_Z; clearFocus(); }
 });
 
 // ── Animate ───────────────────────────────────────────────────────────────────
 function animate() {
   requestAnimationFrame(animate);
 
-  currentPan  = THREE.MathUtils.lerp(currentPan,  targetPan,  0.09);
+  const panLerp = introPanActive ? 0.045 : 0.09;
+  if (introPanActive && Math.abs(currentPan - targetPan) < 2) introPanActive = false;
+  currentPan  = THREE.MathUtils.lerp(currentPan,  targetPan,  panLerp);
   currentZ    = THREE.MathUtils.lerp(currentZ,    targetZ,    0.09);
   currentCamY = THREE.MathUtils.lerp(currentCamY, targetCamY, 0.09);
 
@@ -586,18 +731,39 @@ function animate() {
       (SPREAD_START_Z - currentZ) / (SPREAD_START_Z - SPREAD_END_Z),
       0, 1,
     );
+    // Keep maxPan in sync with spread so the last year's events stay reachable
+    if (!isVertical && positions.length > 0) {
+      maxPan = positions[positions.length - 1].dot.x + spreadDeltas[positions.length - 1] * spreadT;
+    }
+    // Extend backbone and plane icon with current spread
+    if (!isVertical && backboneGeo) {
+      const currentEnd = backboneBaseEndX + backboneMaxSpread * spreadT;
+      const baseLen = backboneBaseEndX - backboneStartX;
+      const segments = 120;
+      const pts = [];
+      for (let j = 0; j <= segments; j++) {
+        const x = THREE.MathUtils.lerp(backboneStartX, currentEnd, j / segments);
+        const t = Math.min(1, (x - backboneStartX) / baseLen);
+        pts.push(x, waveOffset(t), 0);
+      }
+      backboneGeo.setPositions(pts);
+      backbone.computeLineDistances();
+    }
+
     dotMeshes.forEach((dot, i) => {
       const base  = positions[i];
       const delta = spreadDeltas[i] * spreadT;
       if (isVertical) {
         const ny = base.dot.y + delta;
         dot.position.y            = ny;
+        if (dotMasks[i]) dotMasks[i].position.y = ny;
         glowSprites[i].position.y = ny;
         if (cardObjs[i])  cardObjs[i].position.y  = base.card.y  + delta;
         if (yearObjs[i])  yearObjs[i].position.y  = base.label.y + delta;
       } else {
         const nx = base.dot.x + delta;
         dot.position.x            = nx;
+        if (dotMasks[i]) dotMasks[i].position.x = nx;
         glowSprites[i].position.x = nx;
         if (cardObjs[i])   { cardObjs[i].position.x  = base.card.x  + delta; cardObjs[i].position.z  = base.card.z; }
         if (yearObjs[i])   { yearObjs[i].position.x  = base.label.x + delta; yearObjs[i].position.z  = base.label.z; }
@@ -614,11 +780,13 @@ function animate() {
   });
 
   dotMeshes.forEach((dot, i) => {
-    const target = i === hoveredDotIndex ? 1.6 : 1;
+    const target = i === hoveredDotIndex ? 20 * 1.6 : 20;
     dot.scale.x = THREE.MathUtils.lerp(dot.scale.x, target, 0.14);
     dot.scale.y = dot.scale.x;
     dot.scale.z = dot.scale.x;
+    if (dotMasks[i]) dotMasks[i].scale.setScalar(dot.scale.x / 14);
   });
+
 
   renderer.render(scene, camera);
   cssRenderer.render(cssScene, camera);
@@ -641,18 +809,113 @@ window.addEventListener('resize', () => {
   }
 });
 
+// ── Intro / split-flap animation ─────────────────────────────────────────────
+function transitionBoardToCorner(onComplete) {
+  const intro = document.getElementById('intro');
+  const board = document.getElementById('intro-board');
+  const rect  = board.getBoundingClientRect();
+
+  const SCALE = 0.4;
+  const tx = 32 - rect.left;
+  const ty = 28 - rect.top;
+
+  board.style.transformOrigin = 'top left';
+  board.style.transition = 'transform 0.9s cubic-bezier(0.4, 0, 0.2, 1)';
+  board.style.transform = `translate(${tx}px, ${ty}px) scale(${SCALE})`;
+
+  intro.style.transition = 'background 0.6s ease 0.3s';
+  intro.style.background = 'transparent';
+  intro.style.pointerEvents = 'none';
+
+  onComplete();
+}
+
+function runIntro(onComplete) {
+  IMAGES.forEach(src => { new Image().src = src; });
+
+  const CHARS   = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const WORD    = 'TIMELINE';
+  const CYCLES  = 14;
+  const TICK    = 60;
+  const STAGGER = 120;
+  const HOLD    = 1200;
+
+  const board = document.getElementById('intro-flipboard');
+  const panels = WORD.split('').map(() => {
+    const p = document.createElement('div');
+    p.className = 'flip-panel';
+    p.innerHTML =
+      `<div class="flip-top"><div class="flip-char"></div></div>` +
+      `<div class="flip-bot"><div class="flip-char"></div></div>` +
+      `<div class="flip-fold"><div class="flip-fold-inner"><div class="flip-char"></div></div></div>`;
+    board.appendChild(p);
+    return p;
+  });
+
+  let settled = 0;
+
+  panels.forEach((panel, pi) => {
+    const topEl  = panel.querySelector('.flip-top .flip-char');
+    const botEl  = panel.querySelector('.flip-bot .flip-char');
+    const fold   = panel.querySelector('.flip-fold');
+    const foldEl = fold.querySelector('.flip-char');
+    let cycle = 0;
+
+    function tick() {
+      const isFinal = cycle >= CYCLES;
+      const char    = isFinal ? WORD[pi] : CHARS[Math.floor(Math.random() * CHARS.length)];
+
+      foldEl.textContent = topEl.textContent || ' ';
+      fold.getAnimations().forEach(a => a.cancel());
+      fold.animate(
+        [
+          { transform: 'perspective(150px) rotateX(0deg)' },
+          { transform: 'perspective(150px) rotateX(-90deg)' },
+        ],
+        { duration: TICK, easing: 'ease-in', fill: 'forwards' },
+      );
+
+      topEl.textContent = char;
+      botEl.textContent = char;
+      cycle++;
+
+      if (!isFinal) {
+        setTimeout(tick, TICK);
+      } else {
+        settled++;
+        if (settled === panels.length) {
+          setTimeout(() => transitionBoardToCorner(onComplete), HOLD);
+        }
+      }
+    }
+
+    setTimeout(tick, pi * STAGGER);
+  });
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 let events = localEvents;
+let eventsReady   = false;
+let introComplete = false;
+
+function maybeStart() {
+  if (!eventsReady || !introComplete) return;
+  buildScene(isVertical);
+  if (!isVertical) { currentPan = targetPan - 2500; introPanActive = true; }
+}
 
 animate();
 
+runIntro(() => {
+  introComplete = true;
+  maybeStart();
+});
+
 fetchEvents().then(remote => {
-  if (remote && remote.length > 0) {
-    events = remote;
-    buildScene(isVertical);
-  } else {
-    buildScene(isVertical);
-  }
+  if (remote && remote.length > 0) events = remote;
+  eventsReady = true;
+  maybeStart();
 }).catch(() => {
-  buildScene(isVertical);
+  eventsReady = true;
+  maybeStart();
 });

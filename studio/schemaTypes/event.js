@@ -25,6 +25,21 @@ export default defineType({
       validation: Rule => Rule.required(),
     }),
     defineField({
+      name: 'month',
+      title: 'Month / Date',
+      type: 'string',
+    }),
+    defineField({
+      name: 'source',
+      title: 'Source',
+      type: 'string',
+    }),
+    defineField({
+      name: 'sourceUrl',
+      title: 'Source URL',
+      type: 'url',
+    }),
+    defineField({
       name: 'status',
       title: 'Status',
       type: 'string',

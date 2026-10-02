@@ -9,6 +9,6 @@ const client = createClient({
 
 export async function fetchEvents() {
   return client.fetch(
-    `*[_type == "event"] | order(year asc) { year, title, description, status }`
+    `*[_type == "event"] | order(year asc) { year, month, title, description, status, source, sourceUrl }`
   );
 }
